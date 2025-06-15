@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "193557303107",
+    "project_id": "baidoxe-6ce49",
+    "storage_bucket": "baidoxe-6ce49.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:193557303107:android:f7a3e61388209d5cdba9f6",
+        "android_client_info": {
+          "package_name": "com.example.baidoxe"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyATm1ePxiUpJURhvWurr88_g03HxTzswmY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
