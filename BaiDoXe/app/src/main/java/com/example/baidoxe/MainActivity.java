@@ -29,6 +29,7 @@ public class MainActivity extends AppCompatActivity {
     private FirebaseAuth mAuth;
     private DatabaseReference mDatabase;
     private boolean isPasswordVisible = false;
+    private boolean isTransitioning = false; // Biến cờ để ngăn chặn lặp
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -64,13 +65,17 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
 
+            if (isTransitioning) return; // Ngăn chặn lặp nếu đang chuyển
+
+            // Đặt cờ trước khi bắt đầu quá trình
+            isTransitioning = true;
+
             // Đăng nhập với Firebase Authentication
             mAuth.signInWithEmailAndPassword(email, password)
                     .addOnCompleteListener(this, task -> {
                         if (task.isSuccessful()) {
                             Log.d(TAG, "Login successful for email: " + email);
                             String userId = email.replace(".", ",");
-                            // Kiểm tra trạng thái khóa tài khoản
                             if (email.equalsIgnoreCase(ADMIN_EMAIL)) {
                                 Intent intent = new Intent(MainActivity.this, AdminActivity.class);
                                 Toast.makeText(MainActivity.this, "Đăng nhập admin thành công!", Toast.LENGTH_SHORT).show();
@@ -85,25 +90,28 @@ public class MainActivity extends AppCompatActivity {
                                             Log.e(TAG, "Account is locked: " + email);
                                             Toast.makeText(MainActivity.this, "Tài khoản đã bị khóa!", Toast.LENGTH_SHORT).show();
                                             mAuth.signOut();
-                                            return;
+                                        } else {
+                                            Intent intent = new Intent(MainActivity.this, UserActivity.class);
+                                            intent.putExtra("username", email);
+                                            Toast.makeText(MainActivity.this, "Đăng nhập người dùng thành công!", Toast.LENGTH_SHORT).show();
+                                            startActivity(intent);
+                                            finish();
                                         }
-                                        Intent intent = new Intent(MainActivity.this, UserActivity.class);
-                                        intent.putExtra("username", email);
-                                        Toast.makeText(MainActivity.this, "Đăng nhập người dùng thành công!", Toast.LENGTH_SHORT).show();
-                                        startActivity(intent);
-                                        finish();
+                                        isTransitioning = false; // Đặt lại cờ sau khi hoàn tất
                                     }
 
                                     @Override
                                     public void onCancelled(DatabaseError databaseError) {
                                         Log.e(TAG, "Database error: " + databaseError.getMessage());
                                         Toast.makeText(MainActivity.this, "Lỗi khi kiểm tra trạng thái tài khoản: " + databaseError.getMessage(), Toast.LENGTH_SHORT).show();
+                                        isTransitioning = false; // Đặt lại cờ nếu bị hủy
                                     }
                                 });
                             }
                         } else {
                             Log.e(TAG, "Login failed: " + task.getException().getMessage());
                             Toast.makeText(MainActivity.this, "Đăng nhập thất bại: " + task.getException().getMessage(), Toast.LENGTH_SHORT).show();
+                            isTransitioning = false; // Đặt lại cờ nếu thất bại
                         }
                     });
         });

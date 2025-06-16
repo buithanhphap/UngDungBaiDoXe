@@ -25,9 +25,22 @@
         android:id="@+id/iv_map"
         android:layout_width="405dp"
         android:layout_height="244dp"
-        android:layout_marginTop="52dp"
+        android:layout_marginTop="84dp"
         android:scaleType="centerCrop"
         android:src="@drawable/img"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/tv_title" />
+
+    <TextView
+        android:id="@+id/tv_address"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="29dp"
+        android:text="Địa chỉ: 123 Trần Phú, Nha Trang, Khánh Hòa"
+        android:textColor="@color/black"
+        android:textSize="19sp"
+        android:textStyle="bold"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/tv_title" />
