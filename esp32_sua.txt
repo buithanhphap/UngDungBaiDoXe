@@ -1,0 +1,1144 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <MFRC522.h>
+#include <SPI.h>
+#include <ESP32Servo.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <vector>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <map>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <esp_heap_caps.h>
+#include <driver/dac.h> // Thêm để tắt DAC
+
+// WiFi credentials
+const char* ssid = "Hoafi";
+const char* password = "372196111";
+
+// MQTT HiveMQ
+const char* mqttServer1 = "2fc8d5a2c0194161808d87a094595187.s1.eu.hivemq.cloud";
+const int mqttPort1 = 8883;
+const char* mqttClientId1 = "ESP32_Parking";
+const char* mqttUser1 = "myparkinguser";
+const char* mqttPass1 = "MyParkingPass2023!";
+
+// Supabase
+const char* supabaseUrl = "https://abinsucjoahxmgytjoiv.supabase.co";
+const char* supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFiaW5zdWNqb2FoeG1neXRqb2l2Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0MjU0ODkzMywiZXhwIjoyMDU4MTI0OTMzfQ.fMciGBZAXWIx4ElLY_Ng6XcUtUjd3S5c5BpgCZQwGZM";
+
+// Pin definitions
+#define SS_IN_PIN 21
+#define RST_IN_PIN 22
+#define SS_OUT_PIN 15
+#define RST_OUT_PIN 4
+#define SERVO_IN_PIN 13
+#define SERVO_OUT_PIN 14
+#define BUZZER_PIN 12
+#define SLOT1_PIN 34
+#define SLOT2_PIN 35
+#define SLOT3_PIN 32
+#define SLOT4_PIN 33 // Chuyển từ GPIO 25 sang GPIO 33
+#define I2C_SDA 17
+#define I2C_SCL 16
+
+// Global objects
+MFRC522 mfrc522In(SS_IN_PIN, RST_IN_PIN);
+MFRC522 mfrc522Out(SS_OUT_PIN, RST_OUT_PIN);
+Servo servoIn, servoOut;
+AsyncWebServer server(80);
+WiFiClientSecure espClient1;
+PubSubClient mqttClient1(espClient1);
+SemaphoreHandle_t heapMutex;
+
+// Data structures
+std::vector<uint8_t> imageBuffer;
+struct Vehicle {
+  String uid, timeIn, timeOut, imageIn, imageOut;
+};
+std::vector<Vehicle> vehicleList;
+bool slotStatus[4] = {false};
+bool lastSlotStatus[4] = {false};
+int freeSlots = 4;
+char currentUID[16] = "";
+char timeIn[32] = "";
+char timeOut[32] = "";
+char imageInUrl[64] = "";
+char imageOutUrl[64] = "";
+std::map<String, bool> uidState;
+std::map<String, int> uidLastIndex;
+unsigned long totalRevenue = 0;
+const unsigned long revenuePerVehicle = 50000; // Phí gửi xe 50.000 VNĐ
+bool servoInIsOpen = false;
+bool servoOutIsOpen = false;
+unsigned long servoInOpenTime = 0;
+unsigned long servoOutOpenTime = 0;
+unsigned long lastFreeSlots = 4;
+
+// Queue for Supabase
+struct SupabaseEntry {
+  char uid[16];
+  char timeIn[32];
+  char timeOut[32];
+};
+QueueHandle_t supabaseQueue;
+
+// HTML content embedded directly
+const char* htmlContent = R"=====(
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Thông tin bãi giữ xe</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f0f4f8; margin: 0; padding: 20px; text-align: center; }
+    .container { background: #fff; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 600px; margin: auto; }
+    h1 { color: #333; }
+    p { font-size: 16px; color: #444; }
+    .info-section { display: flex; justify-content: space-around; margin-bottom: 20px; }
+    .info-box { flex: 1; background: #f8f9fa; border: 1px solid #ccc; border-radius: 8px; padding: 10px; }
+    .image-box { height: 100px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; margin-top: 10px; }
+    .image-box img { width: 100%; height: 100%; object-fit: cover; }
+    .slot-status { display: flex; gap: 10px; margin-top: 15px; }
+    .slot-card { flex: 1; background: #f1f9ff; border: 1px solid #cde; border-radius: 8px; padding: 10px; }
+    .slot-info { background: #e8f5e9; padding: 10px; border-radius: 8px; font-size: 16px; font-weight: bold; }
+    .slot-info.full { background: #ffebee; color: #c62828; }
+    .history-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    .history-table th, .history-table td { border: 1px solid #ddd; padding: 8px; }
+    .history-table th { background: #f2f2f2; }
+    .history-table img { max-width: 100px; }
+    .history-section { display: none; }
+    .history-section.visible { display: block; }
+    .toggle-button { padding: 8px 16px; margin: 10px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    .toggle-button:hover { background: #45a049; }
+  </style>
+  <script>
+    function fetchData() {
+      fetch('/data')
+        .then(response => {
+          if (!response.ok) throw new Error('Network response was not ok');
+          return response.json();
+        })
+        .then(data => {
+          console.log('Dữ liệu nhận được:', data);
+          document.getElementById("uid").innerText = data.uid || "-";
+          document.getElementById("timeIn").innerText = data.timeIn || "-";
+          document.getElementById("timeOut").innerText = data.timeOut || "-";
+          document.getElementById("slots").innerText = data.freeSlots === 0 ? "Hết chỗ" : `Còn ${data.freeSlots} chỗ trống`;
+          document.getElementById("slots").classList.toggle("full", data.freeSlots === 0);
+          for (let i = 0; i < 4; i++) {
+            document.getElementById(`slot${i+1}`).innerHTML = `<span style='color:${data.slots[i] ? "red" : "green"}'>${data.slots[i] ? "Có xe" : "Trống"}</span>`;
+          }
+          document.getElementById("imgIn").style.display = data.imgIn ? "block" : "none";
+          document.getElementById("imgIn").src = data.imgIn ? `http://${window.location.hostname}${data.imgIn}?t=${Date.now()}` : "";
+          document.getElementById("imgOut").style.display = data.imgOut ? "block" : "none";
+          document.getElementById("imgOut").src = data.imgOut ? `http://${window.location.hostname}${data.imgOut}?t=${Date.now()}` : "";
+        })
+        .catch(error => console.error('Lỗi khi lấy dữ liệu:', error));
+    }
+    function fetchHistory() {
+      fetch('/history')
+        .then(response => {
+          if (!response.ok) throw new Error('Network response was not ok');
+          return response.json();
+        })
+        .then(data => {
+          console.log('Lịch sử nhận được:', data);
+          const table = document.getElementById("historyTable");
+          table.innerHTML = "<tr><th>UID</th><th>Thời gian vào</th><th>Thời gian ra</th><th>Ảnh vào</th><th>Ảnh ra</th></tr>";
+          data.history.forEach(item => {
+            const row = table.insertRow();
+            row.insertCell(0).innerText = item.uid;
+            row.insertCell(1).innerText = item.timeIn || "-";
+            row.insertCell(2).innerText = item.timeOut || "-";
+            const imgInCell = row.insertCell(3);
+            if (item.imageIn) imgInCell.innerHTML = `<img src="http://${window.location.hostname}${item.imageIn}?t=${Date.now()}">`;
+            const imgOutCell = row.insertCell(4);
+            if (item.imageOut) imgOutCell.innerHTML = `<img src="http://${window.location.hostname}${item.imageOut}?t=${Date.now()}">`;
+          });
+        })
+        .catch(error => console.error('Lỗi khi lấy lịch sử:', error));
+    }
+    function toggleHistory() {
+      const historySection = document.getElementById("historySection");
+      const toggleButton = document.getElementById("toggleButton");
+      historySection.classList.toggle("visible");
+      toggleButton.innerText = historySection.classList.contains("visible") ? "Ẩn lịch sử" : "Xem lịch sử";
+      if (historySection.classList.contains("visible")) fetchHistory();
+    }
+    setInterval(fetchData, 5000);
+    setInterval(() => {
+      if (document.getElementById("historySection").classList.contains("visible")) fetchHistory();
+    }, 5000);
+    window.onload = fetchData;
+  </script>
+</head>
+<body>
+  <div class="container">
+    <h1>🚗 Bãi Giữ Xe</h1>
+    <p><strong>Mã UID:</strong> <span id="uid">-</span></p>
+    <div class="info-section">
+      <div class="info-box">
+        <p><strong>⏰ Vào:</strong> <span id="timeIn">-</span></p>
+        <div class="image-box"><img id="imgIn" style="display:none;"></div>
+      </div>
+      <div class="info-box">
+        <p><strong>⏰ Ra:</strong> <span id="timeOut">-</span></p>
+        <div class="image-box"><img id="imgOut" style="display:none;"></div>
+      </div>
+    </div>
+    <div class="slot-info" id="slots">-</div>
+    <div class="slot-status">
+      <div class="slot-card"><p><strong>Chỗ 1:</strong></p><p id="slot1">-</p></div>
+      <div class="slot-card"><p><strong>Chỗ 2:</strong></p><p id="slot2">-</p></div>
+      <div class="slot-card"><p><strong>Chỗ 3:</strong></p><p id="slot3">-</p></div>
+      <div class="slot-card"><p><strong>Chỗ 4:</strong></p><p id="slot4">-</p></div>
+    </div>
+    <button id="toggleButton" class="toggle-button" onclick="toggleHistory()">Xem lịch sử</button>
+  </div>
+  <div class="container history-section" id="historySection">
+    <h2>Lịch sử xe</h2>
+    <table id="historyTable" class="history-table"></table>
+  </div>
+</body>
+</html>
+)=====";
+
+int readAverageAnalog(int pin, int samples = 10) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(10);
+  }
+  return sum / samples;
+}
+
+void getTimeString(char* buf, size_t bufSize) {
+  time_t now = time(nullptr);
+  if (now < 100000) {
+    Serial.println("Thời gian chưa đồng bộ, trả về N/A");
+    strncpy(buf, "N/A", bufSize);
+    return;
+  }
+  struct tm* timeinfo = localtime(&now);
+  strftime(buf, bufSize, "%H:%M %d/%m/%Y", timeinfo); // Định dạng HH:mm dd/MM/yyyy
+  Serial.println("Thời gian ESP32 (+07:00): " + String(buf));
+}
+
+void setupTime() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi chưa kết nối, không thể đồng bộ thời gian!");
+    return;
+  }
+  Serial.println("Cấu hình đồng bộ thời gian với múi giờ Asia/Ho_Chi_Minh (+07:00)");
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com", "time.nist.gov"); // Múi giờ +07:00
+  Serial.println("Đang đồng bộ thời gian với NTP servers...");
+  int attempts = 0;
+  const int maxAttempts = 20;
+  while (attempts < maxAttempts) {
+    time_t now = time(nullptr);
+    if (now >= 100000) {
+      char buf[32];
+      getTimeString(buf, sizeof(buf));
+      Serial.println("Đồng bộ thành công, thời gian: " + String(buf));
+      return;
+    }
+    Serial.println("Thử đồng bộ lần " + String(attempts + 1) + "/" + String(maxAttempts));
+    delay(1500);
+    attempts++;
+  }
+  Serial.println("Không thể đồng bộ thời gian sau " + String(maxAttempts) + " lần thử!");
+}
+
+void reconnectTime() {
+  static unsigned long lastReconnectAttempt = 0;
+  unsigned long currentTime = millis();
+  if (currentTime - lastReconnectAttempt < 60000) { // Thử lại mỗi 60 giây
+    return;
+  }
+  lastReconnectAttempt = currentTime;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi mất kết nối, không thể thử đồng bộ thời gian lại!");
+    return;
+  }
+  Serial.println("Thử đồng bộ lại thời gian...");
+  setupTime();
+}
+
+void beep(int duration = 200) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void alert(int repeat = 3) {
+  for (int i = 0; i < repeat; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+void cleanSPIFFS() {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để xóa SPIFFS!");
+    return;
+  }
+  File root = SPIFFS.open("/");
+  if (!root) {
+    Serial.println("Lỗi mở SPIFFS root!");
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  while (File file = root.openNextFile()) {
+    if (!file.isDirectory()) {
+      String fileName = file.name();
+      file.close();
+      SPIFFS.remove(fileName);
+      Serial.println("Đã xóa: " + fileName);
+    }
+  }
+  root.close();
+  Serial.println("Đã xóa hết ảnh trong SPIFFS");
+  xSemaphoreGive(heapMutex);
+}
+
+void listSPIFFS() {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để liệt kê SPIFFS!");
+    return;
+  }
+  Serial.println("Danh sách file trong SPIFFS:");
+  File root = SPIFFS.open("/");
+  if (!root) {
+    Serial.println("Lỗi mở SPIFFS root!");
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  while (File file = root.openNextFile()) {
+    Serial.println("- " + String(file.name()) + " (" + file.size() + " bytes)");
+    file.close();
+  }
+  root.close();
+  xSemaphoreGive(heapMutex);
+}
+
+String saveImageToSPIFFS(const char* uid, bool isEntry) {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để lưu ảnh!");
+    imageBuffer.clear();
+    return "";
+  }
+  if (!heap_caps_check_integrity(MALLOC_CAP_8BIT, true)) {
+    Serial.println("Heap hỏng trước khi lưu ảnh!");
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return "";
+  }
+  if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 50 * 1024) {
+    Serial.println("Heap thấp, không thể lưu ảnh! Free heap: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return "";
+  }
+  Serial.println("Free heap before saveImage: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  if (SPIFFS.usedBytes() > SPIFFS.totalBytes() * 0.9) {
+    Serial.println("SPIFFS gần đầy, xóa ảnh cũ...");
+    cleanSPIFFS();
+  }
+  char filename[64];
+  snprintf(filename, sizeof(filename), "/img_%s_%s_%lu.jpg", uid, isEntry ? "in" : "out", millis());
+  File file = SPIFFS.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("Lỗi mở file: " + String(filename));
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return "";
+  }
+  if (file.write(imageBuffer.data(), imageBuffer.size()) != imageBuffer.size()) {
+    Serial.println("Lỗi ghi file: " + String(filename));
+    file.close();
+    SPIFFS.remove(filename);
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return "";
+  }
+  file.close();
+  if (imageBuffer.size() < 1000) {
+    Serial.println("Ảnh quá nhỏ: " + String(imageBuffer.size()) + " bytes");
+    SPIFFS.remove(filename);
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return "";
+  }
+  File checkFile = SPIFFS.open(filename, FILE_READ);
+  if (checkFile) {
+    uint8_t header[2];
+    if (checkFile.read(header, 2) == 2) {
+      if (header[0] != 0xFF || header[1] != 0xD8) {
+        Serial.println("File không phải JPEG: " + String(filename));
+        checkFile.close();
+        SPIFFS.remove(filename);
+        imageBuffer.clear();
+        xSemaphoreGive(heapMutex);
+        return "";
+      }
+    }
+    checkFile.close();
+  }
+  Serial.printf("Đã lưu ảnh: %s (%d bytes)\n", filename, imageBuffer.size());
+  listSPIFFS();
+  String result = filename;
+  imageBuffer.clear();
+  Serial.println("Free heap after saveImage: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  xSemaphoreGive(heapMutex);
+  return result;
+}
+
+bool captureImage(const String& camIP, const String& url, int attempt) {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để chụp ảnh!");
+    return false;
+  }
+  if (!heap_caps_check_integrity(MALLOC_CAP_8BIT, true)) {
+    Serial.println("Heap hỏng trước khi chụp ảnh!");
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 50 * 1024) {
+    Serial.println("Heap thấp, không thể chụp ảnh! Free heap: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  Serial.println("Free heap before capture: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  HTTPClient http;
+  http.setTimeout(5000);
+  Serial.println("Thử chụp ảnh từ " + url + ", lần " + String(attempt));
+  imageBuffer.clear();
+  imageBuffer.reserve(10 * 1024);
+  Serial.println("Free heap after reserve: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  http.begin(url);
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    Serial.println("Lỗi gửi yêu cầu CAPTURE qua HTTP: " + String(httpCode));
+    http.end();
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  int contentLength = http.getSize();
+  if (contentLength > 10 * 1024 || contentLength < 0) {
+    Serial.println("Kích thước phản hồi không hợp lệ: " + String(contentLength));
+    http.end();
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  Stream* response = http.getStreamPtr();
+  if (!response) {
+    Serial.println("Lỗi: Không thể lấy stream từ HTTP!");
+    http.end();
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  uint8_t header[2] = {0};
+  if (response->readBytes(header, 2) < 2 || header[0] != 0xFF || header[1] != 0xD8) {
+    Serial.println("Dữ liệu stream không phải JPEG!");
+    http.end();
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  imageBuffer.insert(imageBuffer.end(), header, header + 2);
+  unsigned long timeout = millis() + 5000;
+  size_t totalBytesRead = 2;
+  while (response->available() && millis() < timeout) {
+    uint8_t buffer[64];
+    size_t bytesRead = response->readBytes(buffer, sizeof(buffer));
+    if (bytesRead == 0) break;
+    if (totalBytesRead + bytesRead > 10 * 1024) {
+      Serial.println("Ảnh vượt quá giới hạn 10KB");
+      imageBuffer.clear();
+      http.end();
+      xSemaphoreGive(heapMutex);
+      return false;
+    }
+    imageBuffer.insert(imageBuffer.end(), buffer, buffer + bytesRead);
+    totalBytesRead += bytesRead;
+  }
+  http.end();
+  if (imageBuffer.size() < 1000) {
+    Serial.println("Không nhận được dữ liệu ảnh hợp lệ từ " + url + ", size: " + String(imageBuffer.size()));
+    imageBuffer.clear();
+    xSemaphoreGive(heapMutex);
+    return false;
+  }
+  Serial.println("Nhận ảnh thành công: " + String(imageBuffer.size()) + " bytes");
+  Serial.println("Free heap after capture: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  xSemaphoreGive(heapMutex);
+  return true;
+}
+
+String captureImageSingle(const char* camIP, const char* url, const char* uid, bool isEntry, const char* now) {
+  const int maxAttempts = 1;
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (captureImage(camIP, url, attempt)) {
+      break;
+    }
+    Serial.println("Lỗi chụp ảnh tại " + String(now) + " sau " + String(maxAttempts) + " lần thử");
+    return "";
+  }
+  String imageUrl = saveImageToSPIFFS(uid, isEntry);
+  if (imageUrl.isEmpty()) {
+    Serial.println("Lỗi lưu ảnh tại " + String(now));
+  }
+  return imageUrl;
+}
+
+void sendToSupabase(const char* uid, const char* timeIn, const char* timeOut) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi không kết nối, không gửi dữ liệu lên Supabase");
+    return;
+  }
+  if (strcmp(timeIn, "N/A") == 0 || (strlen(timeOut) > 0 && strcmp(timeOut, "N/A") == 0)) {
+    Serial.println("Thời gian không hợp lệ, không gửi lên Supabase: timeIn=" + String(timeIn) + ", timeOut=" + String(timeOut));
+    return;
+  }
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để gửi Supabase!");
+    return;
+  }
+  if (!heap_caps_check_integrity(MALLOC_CAP_8BIT, true)) {
+    Serial.println("Heap hỏng trước khi gửi Supabase!");
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 50 * 1024) {
+    Serial.println("Heap thấp, không thể gửi Supabase! Free heap: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  Serial.println("Free heap before send: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  HTTPClient http;
+  char url[128];
+  snprintf(url, sizeof(url), "%s/rest/v1/parking_history", supabaseUrl);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + supabaseKey);
+  http.addHeader("apikey", supabaseKey);
+
+  StaticJsonDocument<128> doc;
+  doc["uid"] = uid;
+  doc["time_in"] = strlen(timeIn) > 0 ? timeIn : nullptr;
+  doc["time_out"] = strlen(timeOut) > 0 ? timeOut : nullptr;
+
+  char payload[128];
+  serializeJson(doc, payload, sizeof(payload));
+  Serial.println("Payload gửi lên Supabase: " + String(payload));
+  if (strlen(payload) >= sizeof(payload)) {
+    Serial.println("Payload quá lớn: " + String(strlen(payload)));
+    doc.clear();
+    http.end();
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  int httpCode = http.POST(payload);
+  String response;
+  if (httpCode > 0) {
+    response = http.getString();
+    Serial.println("Phản hồi từ Supabase: " + response);
+  }
+  http.end();
+  doc.clear();
+  response.clear();
+  Serial.println("Free heap after send: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  xSemaphoreGive(heapMutex);
+  if (httpCode == 201) {
+    Serial.println("Gửi dữ liệu lên Supabase thành công");
+  } else {
+    Serial.println("Lỗi gửi dữ liệu lên Supabase, mã lỗi: " + String(httpCode));
+    if (response.length() > 0) {
+      Serial.println("Body lỗi: " + response);
+    }
+  }
+}
+
+void supabaseTask(void* param) {
+  while (true) {
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 50 * 1024) {
+      Serial.println("Heap thấp, tạm dừng supabaseTask! Free heap: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+      vTaskDelay(10000 / portTICK_PERIOD_MS);
+      continue;
+    }
+    SupabaseEntry entry;
+    if (xQueueReceive(supabaseQueue, &entry, portMAX_DELAY) == pdTRUE) {
+      Serial.println("Xử lý gửi dữ liệu Supabase cho UID: " + String(entry.uid));
+      sendToSupabase(entry.uid, entry.timeIn, entry.timeOut);
+    }
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+}
+
+void handleImage(AsyncWebServerRequest* request) {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để xử lý ảnh!");
+    request->send(500, "text/plain", "Lỗi nội bộ");
+    return;
+  }
+  String path = request->url();
+  if (!path.startsWith("/img_") || !SPIFFS.exists(path)) {
+    request->send(404, "text/plain", "Ảnh không tồn tại");
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  File file = SPIFFS.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    request->send(404, "text/plain", "Ảnh không tồn tại");
+    file.close();
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  request->send(SPIFFS, path, "image/jpeg");
+  file.close();
+  xSemaphoreGive(heapMutex);
+}
+
+void handleData(AsyncWebServerRequest* request) {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để xử lý data!");
+    request->send(500, "text/plain", "Lỗi nội bộ");
+    return;
+  }
+  StaticJsonDocument<256> doc;
+  doc["uid"] = strlen(currentUID) > 0 ? String(currentUID) : "-";
+  doc["timeIn"] = strlen(timeIn) > 0 ? String(timeIn) : "-";
+  doc["timeOut"] = strlen(timeOut) > 0 ? String(timeOut) : "-";
+  doc["freeSlots"] = freeSlots;
+  doc["imgIn"] = strlen(imageInUrl) > 0 ? String(imageInUrl) : "";
+  doc["imgOut"] = strlen(imageOutUrl) > 0 ? String(imageOutUrl) : "";
+  JsonArray slots = doc.createNestedArray("slots");
+  for (int i = 0; i < 4; i++) slots.add(slotStatus[i]);
+
+  String json;
+  serializeJson(doc, json);
+  Serial.println("Trả về JSON: " + json);
+  if (json.length() >= 256) {
+    Serial.println("JSON dữ liệu quá lớn: " + String(json.length()));
+    request->send(500, "text/plain", "Lỗi xử lý dữ liệu");
+    doc.clear();
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  request->send(200, "application/json", json);
+  doc.clear();
+  xSemaphoreGive(heapMutex);
+}
+
+void handleHistory(AsyncWebServerRequest* request) {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để xử lý lịch sử!");
+    request->send(500, "text/plain", "Lỗi nội bộ");
+    return;
+  }
+  StaticJsonDocument<512> doc;
+  JsonArray history = doc.createNestedArray("history");
+  for (size_t i = 0; i < vehicleList.size(); i++) {
+    JsonObject item = history.createNestedObject();
+    item["uid"] = vehicleList[i].uid;
+    item["timeIn"] = vehicleList[i].timeIn.isEmpty() ? "-" : vehicleList[i].timeIn;
+    item["timeOut"] = vehicleList[i].timeOut.isEmpty() ? "-" : vehicleList[i].timeOut;
+    item["imageIn"] = vehicleList[i].imageIn;
+    item["imageOut"] = vehicleList[i].imageOut;
+  }
+  String json;
+  serializeJson(doc, json);
+  if (json.length() >= 512) {
+    Serial.println("JSON lịch sử quá lớn: " + String(json.length()));
+    request->send(500, "text/plain", "Lỗi xử lý lịch sử");
+    doc.clear();
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  request->send(200, "application/json", json);
+  doc.clear();
+  xSemaphoreGive(heapMutex);
+}
+
+void setupMQTT() {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để kết nối MQTT!");
+    return;
+  }
+  espClient1.setInsecure();
+  mqttClient1.setServer(mqttServer1, mqttPort1);
+  while (!mqttClient1.connected()) {
+    Serial.print("Kết nối MQTT Broker 1...");
+    if (mqttClient1.connect(mqttClientId1, mqttUser1, mqttPass1)) {
+      Serial.println("Đã kết nối!");
+    } else {
+      Serial.print("Lỗi, rc=");
+      Serial.print(mqttClient1.state());
+      Serial.println(" Thử lại sau 3s...");
+      delay(3000);
+    }
+  }
+  xSemaphoreGive(heapMutex);
+}
+
+void sendToServer() {
+  if (xSemaphoreTake(heapMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    Serial.println("Lỗi: Không thể lấy mutex để gửi MQTT!");
+    return;
+  }
+  if (!heap_caps_check_integrity(MALLOC_CAP_8BIT, true)) {
+    Serial.println("Heap hỏng trước khi gửi MQTT!");
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 50 * 1024) {
+    Serial.println("Heap thấp, không thể gửi MQTT! Free heap: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+    xSemaphoreGive(heapMutex);
+    return;
+  }
+  Serial.println("Free heap before MQTT send: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+
+  if (!mqttClient1.connected()) {
+    Serial.println("Broker ngắt kết nối, đang thử kết nối lại...");
+    setupMQTT();
+    if (!mqttClient1.connected()) {
+      Serial.println("Kết nối MQTT thất bại!");
+      xSemaphoreGive(heapMutex);
+      return;
+    }
+  }
+
+  StaticJsonDocument<128> doc;
+  doc["Slot1"] = slotStatus[0];
+  doc["Slot2"] = slotStatus[1];
+  doc["Slot3"] = slotStatus[2];
+  doc["Slot4"] = slotStatus[3];
+  char mqttData[128];
+  memset(mqttData, 0, sizeof(mqttData));
+  size_t jsonLength = serializeJson(doc, mqttData, sizeof(mqttData));
+  if (jsonLength > 0 && jsonLength < sizeof(mqttData)) {
+    if (mqttClient1.publish("/parking/status", mqttData)) {
+      Serial.println("Gửi thành công: /parking/status -> " + String(mqttData));
+      memcpy(lastSlotStatus, slotStatus, sizeof(slotStatus));
+    } else {
+      Serial.println("Lỗi gửi: /parking/status");
+    }
+  } else {
+    Serial.println("Lỗi serialize JSON, độ dài: " + String(jsonLength));
+  }
+  Serial.println("Free heap after MQTT send: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+  xSemaphoreGive(heapMutex);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Khởi động ESP32...");
+  delay(1000);
+
+  heapMutex = xSemaphoreCreateMutex();
+  if (heapMutex == NULL) {
+    Serial.println("Lỗi: Không thể tạo mutex!");
+    while (true);
+  }
+
+  SPI.begin();
+  mfrc522In.PCD_Init();
+  mfrc522Out.PCD_Init();
+
+  servoIn.attach(SERVO_IN_PIN);
+  servoOut.attach(SERVO_OUT_PIN);
+  servoIn.write(0);
+  servoOut.write(0);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SLOT1_PIN, INPUT);
+  pinMode(SLOT2_PIN, INPUT);
+  pinMode(SLOT3_PIN, INPUT);
+  pinMode(SLOT4_PIN, INPUT);
+  dacDisable(DAC_CHANNEL_1); // Tắt DAC trên GPIO 25 để tránh xung đột
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Lỗi khởi tạo SPIFFS!");
+    while (true);
+  }
+  Serial.println("SPIFFS khởi tạo thành công");
+  cleanSPIFFS();
+  listSPIFFS();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Kết nối WiFi");
+  int wifiAttempts = 0;
+  const int maxWifiAttempts = 30;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < maxWifiAttempts) {
+    delay(500);
+    Serial.print(".");
+    wifiAttempts++;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nKhông thể kết nối WiFi!");
+    while (true);
+  }
+  Serial.println("\n✅ Đã kết nối WiFi");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  setupTime();
+
+  supabaseQueue = xQueueCreate(5, sizeof(SupabaseEntry));
+  if (supabaseQueue == NULL) {
+    Serial.println("Lỗi tạo queue Supabase!");
+    while (true);
+  }
+
+  if (xTaskCreatePinnedToCore(supabaseTask, "SupabaseTask", 32768, NULL, 1, NULL, 0) != pdPASS) {
+    Serial.println("Lỗi: Không thể khởi tạo task SupabaseTask");
+    while (true);
+  }
+
+  setupMQTT();
+
+  memcpy(lastSlotStatus, slotStatus, sizeof(slotStatus));
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/html", htmlContent);
+  });
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/history", HTTP_GET, handleHistory);
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    if (request->url().startsWith("/img_")) {
+      handleImage(request);
+    } else {
+      request->send(404, "text/plain", "Not found");
+    }
+  });
+  server.begin();
+  Serial.println("Web server khởi động");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  static unsigned long lastRFIDInScan = 0;
+  static unsigned long lastRFIDOutScan = 0;
+  static unsigned long lastResetTime = 0;
+  static unsigned long lastMQTTUpdate = 0;
+  static unsigned long lastTimeCheck = 0;
+
+  mqttClient1.loop();
+
+  // Kiểm tra và đồng bộ lại thời gian mỗi 5 phút
+  if (currentTime - lastTimeCheck > 300000) {
+    char buf[32];
+    getTimeString(buf, sizeof(buf));
+    if (strcmp(buf, "N/A") == 0) {
+      Serial.println("Thời gian không hợp lệ, thử đồng bộ lại...");
+      reconnectTime();
+    }
+    lastTimeCheck = currentTime;
+  }
+
+  // Reset dữ liệu UID nếu không có hoạt động trong 15 giây
+  if (strlen(currentUID) > 0 && currentTime - lastRFIDInScan > 15000 && currentTime - lastRFIDOutScan > 15000 && strlen(timeOut) == 0) {
+    memset(currentUID, 0, sizeof(currentUID));
+    memset(timeIn, 0, sizeof(timeIn));
+    memset(timeOut, 0, sizeof(timeOut));
+    memset(imageInUrl, 0, sizeof(imageInUrl));
+    memset(imageOutUrl, 0, sizeof(imageOutUrl));
+    lastResetTime = currentTime;
+    Serial.println("Đã reset dữ liệu UID");
+  }
+
+  // Xử lý RFID vào
+  if (currentTime - lastRFIDInScan > 1000 && mfrc522In.PICC_IsNewCardPresent() && mfrc522In.PICC_ReadCardSerial()) {
+    char muid[16] = "";
+    for (byte i = 0; i < mfrc522In.uid.size; i++) {
+      char hex[3];
+      snprintf(hex, sizeof(hex), "%02X", mfrc522In.uid.uidByte[i]);
+      strncat(muid, hex, sizeof(muid) - strlen(muid) - 1);
+    }
+    char now[32];
+    getTimeString(now, sizeof(now));
+    strncpy(currentUID, muid, sizeof(currentUID));
+    memset(timeIn, 0, sizeof(timeIn));
+    memset(timeOut, 0, sizeof(timeOut));
+    memset(imageInUrl, 0, sizeof(imageInUrl));
+    memset(imageOutUrl, 0, sizeof(imageOutUrl));
+    bool isEntry = (uidState.find(muid) == uidState.end() || !uidState[muid]);
+    Serial.println("Đã đọc thẻ vào, UID: " + String(muid) + ", Thời gian: " + String(now) + ", IsEntry: " + String(isEntry));
+
+    if (isEntry) {
+      if (freeSlots > 0) {
+        if (strcmp(now, "N/A") == 0) {
+          Serial.println("Thời gian không hợp lệ, bỏ qua xe vào UID: " + String(muid));
+          alert();
+          mfrc522In.PICC_HaltA();
+          lastRFIDInScan = currentTime;
+          return;
+        }
+        strncpy(timeIn, now, sizeof(timeIn));
+        const char* camInIP = "192.168.11.233";
+        String imageUrl = captureImageSingle(camInIP, "http://192.168.11.233/capture", muid, true, now);
+        strncpy(imageInUrl, imageUrl.c_str(), sizeof(imageInUrl));
+        if (strlen(imageInUrl) == 0) {
+          Serial.println("Lỗi chụp ảnh vào cho UID: " + String(muid) + ", bỏ qua lưu ảnh nhưng vẫn cho xe vào");
+          alert();
+          freeSlots--;
+          for (size_t i = 0; i < 4; i++) {
+            if (!slotStatus[i]) {
+              slotStatus[i] = true;
+              break;
+            }
+          }
+          vehicleList.push_back({String(muid), String(timeIn), "", "", ""});
+          uidLastIndex[muid] = vehicleList.size() - 1;
+          uidState[muid] = true;
+
+          SupabaseEntry entry;
+          strncpy(entry.uid, muid, sizeof(entry.uid));
+          strncpy(entry.timeIn, timeIn, sizeof(entry.timeIn));
+          entry.timeOut[0] = '\0';
+          if (xQueueSend(supabaseQueue, &entry, portMAX_DELAY) != pdPASS) {
+            Serial.println("Lỗi: Không thể thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+          } else {
+            Serial.println("Đã thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+          }
+
+          Serial.printf("🟢 Xe vào UID %s lúc %s, không có ảnh\n", muid, timeIn);
+          beep();
+          servoIn.write(90);
+          servoInOpenTime = currentTime;
+          servoInIsOpen = true;
+          mfrc522In.PICC_HaltA();
+          lastRFIDInScan = currentTime;
+          return;
+        }
+        freeSlots--;
+        for (size_t i = 0; i < 4; i++) {
+          if (!slotStatus[i]) {
+            slotStatus[i] = true;
+            break;
+          }
+        }
+        vehicleList.push_back({String(muid), String(timeIn), "", imageUrl, ""});
+        uidLastIndex[muid] = vehicleList.size() - 1;
+        uidState[muid] = true;
+
+        SupabaseEntry entry;
+        strncpy(entry.uid, muid, sizeof(entry.uid));
+        strncpy(entry.timeIn, timeIn, sizeof(entry.timeIn));
+        entry.timeOut[0] = '\0';
+        if (xQueueSend(supabaseQueue, &entry, portMAX_DELAY) != pdPASS) {
+          Serial.println("Lỗi: Không thể thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+        } else {
+          Serial.println("Đã thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+        }
+
+        Serial.printf("🟢 Xe vào UID %s lúc %s, ảnh: %s\n", muid, timeIn, imageInUrl);
+        beep();
+        servoIn.write(90);
+        servoInOpenTime = currentTime;
+        servoInIsOpen = true;
+      } else {
+        alert();
+        Serial.println("🔴 Bãi đỗ đầy tại " + String(now));
+      }
+    } else {
+      alert();
+      Serial.println("🔴 Xe đã trong bãi, không thể vào lại: " + String(muid));
+    }
+    mfrc522In.PICC_HaltA();
+    lastRFIDInScan = currentTime;
+  }
+
+  // Xử lý RFID ra
+  if (currentTime - lastRFIDOutScan > 1000 && mfrc522Out.PICC_IsNewCardPresent() && mfrc522Out.PICC_ReadCardSerial()) {
+    char muid[16] = "";
+    for (byte i = 0; i < mfrc522Out.uid.size; i++) {
+      char hex[3];
+      snprintf(hex, sizeof(hex), "%02X", mfrc522Out.uid.uidByte[i]);
+      strncat(muid, hex, sizeof(muid) - strlen(muid) - 1);
+    }
+    char now[32];
+    getTimeString(now, sizeof(now));
+    strncpy(currentUID, muid, sizeof(currentUID));
+    memset(timeIn, 0, sizeof(timeIn));
+    memset(timeOut, 0, sizeof(timeOut));
+    memset(imageInUrl, 0, sizeof(imageInUrl));
+    memset(imageOutUrl, 0, sizeof(imageOutUrl));
+    Serial.println("Đã đọc thẻ ra, UID: " + String(muid) + ", Thời gian: " + String(now));
+
+    int lastIndex = uidLastIndex.find(muid) != uidLastIndex.end() ? uidLastIndex[muid] : -1;
+    if (lastIndex >= 0 && lastIndex < static_cast<int>(vehicleList.size()) && uidState[muid]) {
+      if (strcmp(now, "N/A") == 0) {
+        Serial.println("Thời gian không hợp lệ, bỏ qua xe ra UID: " + String(muid));
+        alert();
+        mfrc522Out.PICC_HaltA();
+        lastRFIDOutScan = currentTime;
+        return;
+      }
+      strncpy(timeIn, vehicleList[lastIndex].timeIn.c_str(), sizeof(timeIn));
+      strncpy(imageInUrl, vehicleList[lastIndex].imageIn.c_str(), sizeof(imageInUrl));
+      strncpy(timeOut, now, sizeof(timeOut));
+      const char* camOutIP = "192.168.11.84";
+      String imageUrl = captureImageSingle(camOutIP, "http://192.168.11.84/capture_on_rfid", muid, false, now);
+      strncpy(imageOutUrl, imageUrl.c_str(), sizeof(imageOutUrl));
+      if (strlen(imageOutUrl) == 0) {
+        Serial.println("Lỗi chụp ảnh ra cho UID: " + String(muid) + ", bỏ qua lưu ảnh nhưng vẫn cho xe ra");
+        alert();
+        freeSlots++;
+        totalRevenue += revenuePerVehicle;
+        for (size_t i = 0; i < 4; i++) {
+          if (slotStatus[i]) {
+            slotStatus[i] = false;
+            break;
+          }
+        }
+        vehicleList[lastIndex].timeOut = timeOut;
+        vehicleList[lastIndex].imageOut = "";
+        uidState[muid] = false;
+
+        SupabaseEntry entry;
+        strncpy(entry.uid, muid, sizeof(entry.uid));
+        strncpy(entry.timeIn, timeIn, sizeof(entry.timeIn));
+        strncpy(entry.timeOut, timeOut, sizeof(entry.timeOut));
+        if (xQueueSend(supabaseQueue, &entry, 3000 / portTICK_PERIOD_MS) != pdPASS) {
+          Serial.println("Lỗi: Không thể thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+        } else {
+          Serial.println("Đã thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+        }
+
+        Serial.printf("✅ Xe ra UID %s lúc %s, không có ảnh, Doanh thu: %lu VNĐ\n",
+                      muid, timeOut, totalRevenue);
+        beep();
+        servoOut.write(90);
+        servoOutOpenTime = currentTime;
+        servoOutIsOpen = true;
+        mfrc522Out.PICC_HaltA();
+        lastRFIDOutScan = currentTime;
+        return;
+      }
+      freeSlots++;
+      totalRevenue += revenuePerVehicle;
+      for (size_t i = 0; i < 4; i++) {
+        if (slotStatus[i]) {
+          slotStatus[i] = false;
+          break;
+        }
+      }
+      vehicleList[lastIndex].timeOut = timeOut;
+      vehicleList[lastIndex].imageOut = imageOutUrl;
+      uidState[muid] = false;
+      Serial.printf("✅ Xe ra UID %s lúc %s, ảnh: %s, Doanh thu: %lu VNĐ\n",
+                    muid, timeOut, imageOutUrl, totalRevenue);
+
+      SupabaseEntry entry;
+      strncpy(entry.uid, muid, sizeof(entry.uid));
+      strncpy(entry.timeIn, timeIn, sizeof(entry.timeIn));
+      strncpy(entry.timeOut, timeOut, sizeof(entry.timeOut));
+      if (xQueueSend(supabaseQueue, &entry, 3000 / portTICK_PERIOD_MS) != pdPASS) {
+        Serial.println("Lỗi: Không thể thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+      } else {
+        Serial.println("Đã thêm dữ liệu vào queue Supabase cho UID: " + String(muid));
+      }
+
+      beep();
+      servoOut.write(90);
+      servoOutOpenTime = currentTime;
+      servoOutIsOpen = true;
+    } else {
+      Serial.println("Lỗi: Xe không có trong bãi hoặc UID không hợp lệ: " + String(muid));
+      alert();
+    }
+    mfrc522Out.PICC_HaltA();
+    lastRFIDOutScan = currentTime;
+  }
+
+  // Kiểm tra trạng thái cảm biến
+  bool slotStatusChanged = false;
+  bool newSlotStatus[4];
+  newSlotStatus[0] = readAverageAnalog(SLOT1_PIN) < 100;
+  newSlotStatus[1] = readAverageAnalog(SLOT2_PIN) < 100;
+  newSlotStatus[2] = readAverageAnalog(SLOT3_PIN) < 100;
+  newSlotStatus[3] = readAverageAnalog(SLOT4_PIN) < 200; // Ngưỡng cho GPIO 33
+  Serial.printf("Slot 4 (GPIO 33) - Giá trị analog: %d, Trạng thái: %s\n",
+                readAverageAnalog(SLOT4_PIN), newSlotStatus[3] ? "Có xe" : "Trống");
+
+  for (int i = 0; i < 4; i++) {
+    if (newSlotStatus[i] != slotStatus[i]) {
+      slotStatusChanged = true;
+      slotStatus[i] = newSlotStatus[i];
+      Serial.printf("Slot %d trạng thái thay đổi: %s\n", i + 1, slotStatus[i] ? "Có xe" : "Trống");
+    }
+  }
+
+  // Cập nhật số slot trống dựa trên cảm biến
+  int tempFreeSlots = 0;
+  for (int i = 0; i < 4; i++) {
+    if (!slotStatus[i]) {
+      tempFreeSlots++;
+    }
+  }
+  if (tempFreeSlots != freeSlots) {
+    freeSlots = tempFreeSlots;
+    lastFreeSlots = freeSlots;
+    Serial.printf("Số slot trống: %d\n", freeSlots);
+  }
+
+  // Gửi dữ liệu MQTT nếu trạng thái thay đổi
+  if (slotStatusChanged && currentTime - lastMQTTUpdate > 5000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi mất kết nối, đang thử kết nối lại...");
+      WiFi.reconnect();
+      delay(1000);
+    } else {
+      const int minHeapRequired = 50 * 1024;
+      int heapAttempts = 0;
+      const int maxHeapAttempts = 20;
+      while (heap_caps_get_free_size(MALLOC_CAP_8BIT) < minHeapRequired && heapAttempts < maxHeapAttempts) {
+        Serial.println("Heap chưa đủ để gửi MQTT, chờ... Free heap: " + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        heapAttempts++;
+      }
+      if (heap_caps_get_free_size(MALLOC_CAP_8BIT) >= minHeapRequired) {
+        Serial.println("WiFi vẫn kết nối, IP: " + WiFi.localIP().toString());
+        Serial.println("Heap đủ, gửi dữ liệu MQTT...");
+        sendToServer();
+      } else {
+        Serial.println("Heap vẫn thấp sau " + String(maxHeapAttempts) + " lần thử, bỏ qua gửi MQTT!");
+      }
+    }
+    lastMQTTUpdate = currentTime;
+  }
+
+  // Đóng cổng servo
+  if (servoInIsOpen && currentTime - servoInOpenTime > 15000) {
+    servoIn.write(0);
+    servoInIsOpen = false;
+    Serial.println("Đóng cổng vào");
+  }
+  if (servoOutIsOpen && currentTime - servoOutOpenTime > 15000) {
+    servoOut.write(0);
+    servoOutIsOpen = false;
+    Serial.println("Đóng cổng ra");
+  }
+
+  // Xóa vehicleList nếu vượt quá 20
+  if (vehicleList.size() > 20) {
+    vehicleList.erase(vehicleList.begin());
+    for (auto& pair : uidLastIndex) {
+      if (pair.second > 0) pair.second--;
+      else uidLastIndex.erase(pair.first);
+    }
+  }
+
+  delay(200);
+}
